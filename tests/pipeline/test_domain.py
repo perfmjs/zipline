@@ -117,9 +117,11 @@ class SpecializeTestCase(zf.ZiplineTestCase):
 
             # Specializations should be memoized.
             self.assertIs(specialized, cls.specialize(domain))
+            self.assertIs(specialized, specialized.specialize(domain))
 
-            # Specializations should have the same name.
+            # Specializations should have the same name and module
             assert_equal(specialized.__name__, cls.__name__)
+            assert_equal(specialized.__module__, cls.__module__)
             self.assertIs(specialized.domain, domain)
 
             for attr in colnames:
@@ -566,3 +568,8 @@ class RollForwardTestCase(zf.ZiplineTestCase):
             session_domain.roll_forward('2000-02-02'),
             pd.Timestamp('2000-04-01', tz='UTC'),
         )
+
+
+class ReprTestCase(zf.ZiplineTestCase):
+    def test_generic_domain_repr(self):
+        self.assertEqual(repr(GENERIC), "GENERIC")

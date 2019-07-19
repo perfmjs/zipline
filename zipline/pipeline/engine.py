@@ -59,7 +59,7 @@ from abc import ABCMeta, abstractmethod
 from functools import partial
 
 from six import iteritems, with_metaclass, viewkeys
-from numpy import array
+from numpy import array, arange
 from pandas import DataFrame, MultiIndex
 from toolz import groupby
 
@@ -107,7 +107,7 @@ class PipelineEngine(with_metaclass(ABCMeta)):
 
             The ``result`` columns correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
-            instances of :class:`zipline.pipeline.term.Term`.
+            instances of :class:`zipline.pipeline.Term`.
 
             For each date between ``start_date`` and ``end_date``, ``result``
             will contain a row for each asset that passed `pipeline.screen`.
@@ -150,7 +150,7 @@ class PipelineEngine(with_metaclass(ABCMeta)):
 
             The ``result`` columns correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
-            instances of :class:`zipline.pipeline.term.Term`.
+            instances of :class:`zipline.pipeline.Term`.
 
             For each date between ``start_date`` and ``end_date``, ``result``
             will contain a row for each asset that passed `pipeline.screen`.
@@ -319,7 +319,7 @@ class SimplePipelineEngine(PipelineEngine):
 
             The ``result`` columns correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
-            instances of :class:`zipline.pipeline.term.Term`.
+            instances of :class:`zipline.pipeline.Term`.
 
             For each date between ``start_date`` and ``end_date``, ``result``
             will contain a row for each asset that passed `pipeline.screen`.
@@ -372,7 +372,7 @@ class SimplePipelineEngine(PipelineEngine):
 
             The ``result`` columns correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
-            instances of :class:`zipline.pipeline.term.Term`.
+            instances of :class:`zipline.pipeline.Term`.
 
             For each date between ``start_date`` and ``end_date``, ``result``
             will contain a row for each asset that passed `pipeline.screen`.
@@ -408,9 +408,9 @@ class SimplePipelineEngine(PipelineEngine):
         root_mask = self._compute_root_mask(
             domain, start_date, end_date, extra_rows,
         )
-        dates, assets, root_mask_values = explode(root_mask)
+        dates, sids, root_mask_values = explode(root_mask)
 
-        initial_workspace = self._populate_initial_workspace(
+        workspace = self._populate_initial_workspace(
             {
                 self._root_mask_term: root_mask_values,
                 self._root_mask_dates_term: as_column(dates.values)
@@ -418,19 +418,24 @@ class SimplePipelineEngine(PipelineEngine):
             self._root_mask_term,
             plan,
             dates,
-            assets,
+            sids,
         )
 
-        with hooks.computing_chunk(plan,
-                                   initial_workspace,
+        refcounts = plan.initial_refcounts(workspace)
+        execution_order = plan.execution_order(workspace, refcounts)
+
+        with hooks.computing_chunk(execution_order,
                                    start_date,
                                    end_date):
+
             results = self.compute_chunk(
-                plan,
-                dates,
-                assets,
-                initial_workspace,
-                hooks,
+                graph=plan,
+                dates=dates,
+                sids=sids,
+                workspace=workspace,
+                refcounts=refcounts,
+                execution_order=execution_order,
+                hooks=hooks,
             )
 
         return self._to_narrow(
@@ -438,7 +443,7 @@ class SimplePipelineEngine(PipelineEngine):
             results,
             results.pop(plan.screen_name),
             dates[extra_rows:],
-            assets,
+            sids,
         )
 
     def _compute_root_mask(self, domain, start_date, end_date, extra_rows):
@@ -527,7 +532,7 @@ class SimplePipelineEngine(PipelineEngine):
         return ret
 
     @staticmethod
-    def _inputs_for_term(term, workspace, graph, domain):
+    def _inputs_for_term(term, workspace, graph, domain, refcounts):
         """
         Compute inputs for the given term.
 
@@ -554,6 +559,12 @@ class SimplePipelineEngine(PipelineEngine):
                     adjusted_array.traverse(
                         window_length=term.window_length,
                         offset=offsets[term, input_],
+                        # If the refcount for the input is > 1, we will need
+                        # to traverse this array again so we must copy.
+                        # If the refcount for the input == 0, this is the last
+                        # traversal that will happen so we can invalidate
+                        # the AdjustedArray and mutate the data in place.
+                        copy=refcounts[input_] > 1,
                     )
                 )
         else:
@@ -569,7 +580,14 @@ class SimplePipelineEngine(PipelineEngine):
                 out.append(input_data)
         return out
 
-    def compute_chunk(self, graph, dates, sids, initial_workspace, hooks):
+    def compute_chunk(self,
+                      graph,
+                      dates,
+                      sids,
+                      workspace,
+                      refcounts,
+                      execution_order,
+                      hooks):
         """
         Compute the Pipeline terms in the graph for the requested start and end
         dates.
@@ -582,13 +600,19 @@ class SimplePipelineEngine(PipelineEngine):
             Dependency graph of the terms to be executed.
         dates : pd.DatetimeIndex
             Row labels for our root mask.
-        assets : pd.Int64Index
+        sids : pd.Int64Index
             Column labels for our root mask.
-        initial_workspace : dict
+        workspace : dict
             Map from term -> output.
             Must contain at least entry for `self._root_mask_term` whose shape
             is `(len(dates), len(assets))`, but may contain additional
             pre-computed terms for testing or optimization purposes.
+        refcounts : dict[Term, int]
+            Dictionary mapping terms to number of dependent terms. When a
+            term's refcount hits 0, it can be safely discarded from
+            ``workspace``. See TermGraph.decref_dependencies for more info.
+        execution_order : list[Term]
+            Order in which to execute terms.
         hooks : implements(PipelineHooks)
             Hooks to instrument pipeline execution.
 
@@ -597,15 +621,12 @@ class SimplePipelineEngine(PipelineEngine):
         results : dict
             Dictionary mapping requested results to outputs.
         """
-        self._validate_compute_chunk_params(
-            graph, dates, sids, initial_workspace,
-        )
+        self._validate_compute_chunk_params(graph, dates, sids, workspace)
+
         get_loader = self._get_loader
 
         # Copy the supplied initial workspace so we don't mutate it in place.
-        workspace = initial_workspace.copy()
-        refcounts = graph.initial_refcounts(workspace)
-        execution_order = graph.execution_order(refcounts)
+        workspace = workspace.copy()
         domain = graph.domain
 
         # Many loaders can fetch data more efficiently if we ask them to
@@ -638,7 +659,7 @@ class SimplePipelineEngine(PipelineEngine):
             (t for t in execution_order if t in will_be_loaded),
         )
 
-        for term in graph.execution_order(refcounts):
+        for term in execution_order:
             # `term` may have been supplied in `initial_workspace`, or we may
             # have loaded `term` as part of a batch with another term coming
             # from the same loader (see note on loader_group_key above). In
@@ -675,7 +696,13 @@ class SimplePipelineEngine(PipelineEngine):
             else:
                 with hooks.computing_term(term):
                     workspace[term] = term._compute(
-                        self._inputs_for_term(term, workspace, graph, domain),
+                        self._inputs_for_term(
+                            term,
+                            workspace,
+                            graph,
+                            domain,
+                            refcounts,
+                        ),
                         mask_dates,
                         sids,
                         mask,
@@ -746,10 +773,6 @@ class SimplePipelineEngine(PipelineEngine):
                 index=MultiIndex.from_arrays([empty_dates, empty_assets]),
             )
 
-        resolved_assets = array(self._finder.retrieve_all(assets))
-        dates_kept = repeat_last_axis(dates.values, len(assets))[mask]
-        assets_kept = repeat_first_axis(resolved_assets, len(dates))[mask]
-
         final_columns = {}
         for name in data:
             # Each term that computed an output has its postprocess method
@@ -759,10 +782,10 @@ class SimplePipelineEngine(PipelineEngine):
             # LabelArrays into categoricals.
             final_columns[name] = terms[name].postprocess(data[name][mask])
 
-        return DataFrame(
-            data=final_columns,
-            index=MultiIndex.from_arrays([dates_kept, assets_kept]),
-        ).tz_localize('UTC', level=0)
+        resolved_assets = array(self._finder.retrieve_all(assets))
+        index = _pipeline_output_index(dates, resolved_assets, mask)
+
+        return DataFrame(data=final_columns, index=index)
 
     def _validate_compute_chunk_params(self,
                                        graph,
@@ -866,3 +889,34 @@ class SimplePipelineEngine(PipelineEngine):
         if hooks is None:
             hooks = []
         return DelegatingHooks(self._default_hooks + hooks)
+
+
+def _pipeline_output_index(dates, assets, mask):
+    """
+    Create a MultiIndex for a pipeline output.
+
+    Parameters
+    ----------
+    dates : pd.DatetimeIndex
+        Row labels for ``mask``.
+    assets : pd.Index
+        Column labels for ``mask``.
+    mask : np.ndarray[bool]
+        Mask array indicating date/asset pairs that should be included in
+        output index.
+
+    Returns
+    -------
+    index : pd.MultiIndex
+        MultiIndex  containing (date,  asset) pairs  corresponding to  ``True``
+        values in ``mask``.
+    """
+    date_labels = repeat_last_axis(arange(len(dates)), len(assets))[mask]
+    asset_labels = repeat_first_axis(arange(len(assets)), len(dates))[mask]
+    return MultiIndex(
+        levels=[dates, assets],
+        labels=[date_labels, asset_labels],
+        # TODO: We should probably add names for these.
+        names=[None, None],
+        verify_integrity=False,
+    )
